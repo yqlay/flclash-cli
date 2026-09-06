@@ -76,10 +76,19 @@ func cliSSHConfigControlPath(sshPath string, profile cliSSHProfile) string {
 	if controlPath == "" || strings.EqualFold(controlPath, "none") {
 		return ""
 	}
-	if controlMaster == "no" {
+	if !cliSSHControlMasterEnabled(controlMaster) {
 		return ""
 	}
 	return expandCLISSHIdentityPath(controlPath)
+}
+
+func cliSSHControlMasterEnabled(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "yes", "true", "auto", "ask", "autoask":
+		return true
+	default:
+		return false
+	}
 }
 
 func cliSSHControlPathOwned(path string) bool {
