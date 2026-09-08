@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"path/filepath"
@@ -14,6 +15,49 @@ import (
 
 	"golang.org/x/net/proxy"
 )
+
+func TestSSHRelayUpstreamHandshakeHonorsCancellation(t *testing.T) {
+	listener := listenCLITestTCP(t)
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err == nil {
+			accepted <- connection
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		connection, err := dialCLISSHRelayUpstream(ctx, listener.Addr().(*net.TCPAddr).Port, "example.test:443")
+		if connection != nil {
+			connection.Close()
+		}
+		done <- err
+	}()
+	var upstream net.Conn
+	select {
+	case upstream = <-accepted:
+		defer upstream.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream not contacted")
+	}
+	// The server accepts TCP but never responds to the SOCKS greeting.
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled SOCKS handshake unexpectedly succeeded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation did not release stalled handshake")
+	}
+	upstream.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.Copy(io.Discard, upstream); err != nil {
+		t.Fatalf("cancelled handshake did not close upstream: %v", err)
+	}
+}
 
 func TestCLISSHRelayMetersSOCKS5Traffic(t *testing.T) {
 	echo := listenCLITestTCP(t)

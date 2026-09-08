@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -2381,6 +2382,8 @@ func cliSSHDynamicForwardArguments(state cliSSHTunnelState) []string {
 func cliSSHControlClientArguments(state cliSSHTunnelState) []string {
 	return []string{
 		"-S", state.ControlPath,
+		// A missing master must never fall back to a fresh network connection.
+		"-o", "ProxyCommand=false",
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "PubkeyAuthentication=no",
@@ -2827,10 +2830,14 @@ func cliSSHMasterAlive(sshPath string, state cliSSHTunnelState) bool {
 	if state.ControlPath == "" {
 		return false
 	}
-	check := exec.Command(
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	check := exec.CommandContext(
+		ctx,
 		sshPath,
 		cliSSHControlOperationArguments(state, "check")...,
 	)
+	check.WaitDelay = time.Second
 	return runCLISSHProbe(check) == nil
 }
 func saveCLISSHTunnelState(state cliSSHTunnelState) error {
@@ -2949,7 +2956,7 @@ func stopAllCLISSHTunnels() error {
 	}
 	var stopErrors []error
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || entry.Name() == cliSSHLastErrorFile || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
 		path := filepath.Join(directory, entry.Name())

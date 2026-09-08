@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
@@ -159,9 +160,12 @@ func (r *tuiServiceRuntime) clearPersistentHistory() (bool, error) {
 
 func (r *tuiServiceRuntime) recordHistoryUpdate(entries []tuiRequest) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if slices.Equal(r.history, entries) {
+		return
+	}
 	r.history = entries
 	r.historyVersion++
-	r.mu.Unlock()
 }
 
 const tuiHistoryCollectorInterval = 2 * time.Second

@@ -4,12 +4,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -85,10 +88,19 @@ func importCLISSHConfigHosts(filePath string, wanted []string) ([]string, []stri
 	}
 	imported := make([]string, 0, len(entries))
 	skipped := make([]string, 0)
+	seen := make(map[string]bool)
 	for _, entry := range entries {
-		if len(wantedSet) > 0 && !wantedSet[strings.ToLower(entry.Name)] {
+		key := strings.ToLower(entry.Name)
+		if seen[key] || (len(wantedSet) > 0 && !wantedSet[key]) {
 			continue
 		}
+		seen[key] = true
+		resolved, resolveErr := resolveCLIImportedSSHHost(filePath, entry)
+		if resolveErr != nil {
+			skipped = append(skipped, entry.Name+": "+resolveErr.Error())
+			continue
+		}
+		entry = resolved
 		profile, skipReason := cliSSHProfileFromOpenSSHHost(entry)
 		if skipReason != "" {
 			skipped = append(skipped, entry.Name+": "+skipReason)
@@ -100,7 +112,59 @@ func importCLISSHConfigHosts(filePath string, wanted []string) ([]string, []stri
 		}
 		imported = append(imported, profile.Name)
 	}
+	for _, name := range wanted {
+		if !seen[strings.ToLower(name)] {
+			skipped = append(skipped, name+": no concrete OpenSSH Host entry found")
+		}
+	}
 	return imported, skipped, nil
+}
+
+// Let OpenSSH evaluate first-value precedence, Host patterns, Include and Match
+// rather than interpreting the collected concrete Host blocks as full configs.
+func resolveCLIImportedSSHHost(filePath string, entry openSSHHostConfig) (openSSHHostConfig, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "ssh", "-G", "-F", expandCLISSHIdentityPath(filePath), entry.Name)
+	command.WaitDelay = time.Second
+	prepareCLISSHNonInteractiveCommand(command)
+	var stdout, stderr cliSSHCappedBuffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		return entry, fmt.Errorf("resolve OpenSSH Host %q: %w: %s", entry.Name, err, cliSSHOutputSummary(stderr.String()))
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		key, value, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		switch key {
+		case "hostname":
+			entry.HostName = value
+		case "user":
+			entry.User = value
+		case "port":
+			port, err := strconv.Atoi(value)
+			if err != nil {
+				return entry, fmt.Errorf("invalid resolved SSH port %q", value)
+			}
+			entry.Port = port
+		case "proxyjump":
+			entry.Jump = value
+			if value == "none" {
+				entry.Jump = ""
+			}
+		case "identityfile":
+			if entry.Identity == "" && value != "none" {
+				identity := expandCLISSHIdentityPath(value)
+				if info, err := os.Stat(identity); err == nil && info.Mode().IsRegular() {
+					entry.Identity = identity
+				}
+			}
+		}
+	}
+	return entry, nil
 }
 
 func cliSSHProfileFromOpenSSHHost(entry openSSHHostConfig) (cliSSHProfile, string) {
@@ -108,10 +172,9 @@ func cliSSHProfileFromOpenSSHHost(entry openSSHHostConfig) (cliSSHProfile, strin
 	if name == "" {
 		return cliSSHProfile{}, "Host alias is not a valid FlClash profile name"
 	}
-	host := strings.TrimSpace(entry.HostName)
-	if host == "" {
-		host = strings.TrimSpace(entry.Name)
-	}
+	// Keep the original alias for Host-specific OpenSSH settings (notably
+	// ControlPath). Pin its resolved destination separately for custom imports.
+	host := strings.TrimSpace(entry.Name)
 	port := entry.Port
 	if port == 0 {
 		port = 22
@@ -124,6 +187,9 @@ func cliSSHProfileFromOpenSSHHost(entry openSSHHostConfig) (cliSSHProfile, strin
 		Jump:     strings.TrimSpace(entry.Jump),
 		Identity: strings.TrimSpace(entry.Identity),
 	})
+	if hostname := strings.TrimSpace(entry.HostName); hostname != "" && hostname != host {
+		profile.Options = append(profile.Options, "HostName="+hostname)
+	}
 	if err := validateCLISSHProfile(profile); err != nil {
 		return cliSSHProfile{}, err.Error()
 	}
@@ -156,7 +222,7 @@ func parseOpenSSHConfigFile(path string, depth int) ([]openSSHHostConfig, error)
 	defer file.Close()
 	var (
 		entries []openSSHHostConfig
-		current *openSSHHostConfig
+		current []int
 	)
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -173,8 +239,7 @@ func parseOpenSSHConfigFile(path string, depth int) ([]openSSHHostConfig, error)
 					continue
 				}
 				entries = append(entries, openSSHHostConfig{Name: alias})
-				current = &entries[len(entries)-1]
-				break
+				current = append(current, len(entries)-1)
 			}
 		case "match":
 			current = nil
@@ -186,12 +251,12 @@ func parseOpenSSHConfigFile(path string, depth int) ([]openSSHHostConfig, error)
 			entries = append(entries, included...)
 			current = nil
 		case "hostname":
-			if current != nil {
-				current.HostName = value
+			for _, index := range current {
+				entries[index].HostName = value
 			}
 		case "user":
-			if current != nil {
-				current.User = value
+			for _, index := range current {
+				entries[index].User = value
 			}
 		case "port":
 			if current == nil {
@@ -199,16 +264,22 @@ func parseOpenSSHConfigFile(path string, depth int) ([]openSSHHostConfig, error)
 			}
 			port, convErr := strconv.Atoi(value)
 			if convErr != nil || port < 1 || port > 65535 {
-				return nil, fmt.Errorf("invalid Port %q for Host %q", value, current.Name)
+				return nil, fmt.Errorf("invalid Port %q for Host %q", value, entries[current[0]].Name)
 			}
-			current.Port = port
+			for _, index := range current {
+				entries[index].Port = port
+			}
 		case "identityfile":
-			if current != nil && current.Identity == "" {
-				current.Identity = expandCLISSHIdentityPath(value)
+			for _, index := range current {
+				if entries[index].Identity == "" {
+					entries[index].Identity = expandCLISSHIdentityPath(value)
+				}
 			}
 		case "proxyjump", "jumphost":
-			if current != nil && current.Jump == "" {
-				current.Jump = value
+			for _, index := range current {
+				if entries[index].Jump == "" {
+					entries[index].Jump = value
+				}
 			}
 		}
 	}
@@ -256,20 +327,15 @@ func splitOpenSSHConfigLine(line string) (string, string, bool) {
 	if strings.HasPrefix(line, "=") {
 		return "", "", false
 	}
-	keyword, value, found := strings.Cut(line, " ")
-	if !found {
-		keyword, value, found = strings.Cut(line, "=")
-	} else if strings.Contains(keyword, "=") {
-		keyword, value, found = strings.Cut(line, "=")
-	} else if strings.HasPrefix(strings.TrimSpace(value), "=") {
-		value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "="))
-		found = true
-	}
-	if !found {
+	separator := strings.IndexFunc(line, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '='
+	})
+	if separator < 1 {
 		return "", "", false
 	}
-	keyword = strings.TrimSpace(keyword)
-	value = unquoteOpenSSHConfigValue(strings.TrimSpace(value))
+	keyword := line[:separator]
+	value := strings.TrimSpace(line[separator:])
+	value = unquoteOpenSSHConfigValue(strings.TrimSpace(strings.TrimPrefix(value, "=")))
 	if keyword == "" || value == "" {
 		return "", "", false
 	}
@@ -278,14 +344,33 @@ func splitOpenSSHConfigLine(line string) (string, string, bool) {
 
 func unquoteOpenSSHConfigValue(value string) string {
 	value = strings.TrimSpace(value)
+	var quote rune
+	escaped := false
+	for index, r := range value {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+		} else if r == '"' || r == '\'' {
+			quote = r
+		} else if r == '#' {
+			value = strings.TrimSpace(value[:index])
+			break
+		}
+	}
 	if len(value) >= 2 {
 		if (value[0] == '"' && value[len(value)-1] == '"') ||
 			(value[0] == '\'' && value[len(value)-1] == '\'') {
 			return value[1 : len(value)-1]
 		}
-	}
-	if comment := strings.Index(value, " #"); comment >= 0 {
-		value = strings.TrimSpace(value[:comment])
 	}
 	return value
 }

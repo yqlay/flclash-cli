@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -205,17 +206,9 @@ func (r *cliSSHRelay) serveSOCKS(client net.Conn) {
 	if err != nil {
 		return
 	}
-	dialer, err := proxy.SOCKS5(
-		"tcp",
-		net.JoinHostPort("127.0.0.1", strconv.Itoa(r.upstreamPort)),
-		nil,
-		proxy.Direct,
-	)
-	if err != nil {
-		writeCLISOCKS5Reply(client, 0x01)
-		return
-	}
-	upstream, err := dialer.Dial("tcp", target)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	upstream, err := dialCLISSHRelayUpstream(ctx, r.upstreamPort, target)
 	if err != nil {
 		writeCLISOCKS5Reply(client, 0x05)
 		return
@@ -245,6 +238,20 @@ func (r *cliSSHRelay) serveSOCKS(client net.Conn) {
 		}
 	}()
 	wait.Wait()
+}
+
+func dialCLISSHRelayUpstream(ctx context.Context, port int, target string) (net.Conn, error) {
+	dialer, err := proxy.SOCKS5(
+		"tcp",
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		nil,
+		&net.Dialer{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	// The context bounds the SOCKS handshake as well as the TCP connection.
+	return dialer.(proxy.ContextDialer).DialContext(ctx, "tcp", target)
 }
 
 func readCLIInboundSOCKS5(connection net.Conn) (string, error) {

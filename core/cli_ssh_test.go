@@ -836,6 +836,7 @@ func TestCLISSHControlArgumentsCannotPromptOrReauthenticate(t *testing.T) {
 		for _, expected := range []string{
 			" -S /tmp/control.sock ",
 			" BatchMode=yes ",
+			" ProxyCommand=false ",
 			" StrictHostKeyChecking=yes ",
 			" PubkeyAuthentication=no ",
 			" PasswordAuthentication=no ",

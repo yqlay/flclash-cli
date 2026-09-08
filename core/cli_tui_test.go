@@ -2384,6 +2384,31 @@ func TestTUISearchAndFilterCloseStaleDetails(t *testing.T) {
 	}
 }
 
+func TestTUILogExportsNeverOverwritePreviousExport(t *testing.T) {
+	directory := t.TempDir()
+	seen := map[string]bool{}
+	for range 10 {
+		path, err := exportTUILogs(directory, []string{"retained log"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[path] {
+			t.Fatalf("export reused %s", path)
+		}
+		seen[path] = true
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("export permissions: %v", err)
+		}
+	}
+	for path := range seen {
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != "retained log\n" {
+			t.Fatalf("export lost: %v", err)
+		}
+	}
+}
+
 func TestTUILogExportAndClear(t *testing.T) {
 	clearTUILogs()
 	sendMessage(Message{

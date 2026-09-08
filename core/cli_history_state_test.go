@@ -22,6 +22,29 @@ func TestTUIHistoryCollectorIntervalIsAtLeastTwoSeconds(t *testing.T) {
 	}
 }
 
+func TestHistoryCollectorDoesNotDirtyUnchangedSnapshots(t *testing.T) {
+	runtime := &tuiServiceRuntime{}
+	runtime.recordHistoryUpdate([]tuiRequest{})
+	if runtime.historyVersion != 0 {
+		t.Fatal("empty poll dirtied empty history")
+	}
+	entries := []tuiRequest{{tuiConnection: tuiConnection{ID: "closed"}, Active: false}}
+	runtime.recordHistoryUpdate(entries)
+	version := runtime.historyVersion
+	for range 3 {
+		runtime.recordHistoryUpdate(updateTUIRequestHistory(entries, nil, time.Now()))
+	}
+	if runtime.historyVersion != version {
+		t.Fatal("unchanged closed connections dirtied history on each poll")
+	}
+	changed := append([]tuiRequest(nil), entries...)
+	changed[0].Download++
+	runtime.recordHistoryUpdate(changed)
+	if runtime.historyVersion != version+1 {
+		t.Fatal("traffic change did not dirty history")
+	}
+}
+
 func TestTUIHistoryPersistSkipsUnchangedFile(t *testing.T) {
 	directory := t.TempDir()
 	now := time.Now().UTC().Truncate(time.Second)

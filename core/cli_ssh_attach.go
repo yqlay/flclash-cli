@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,8 @@ import (
 )
 
 const cliSSHAttachedKind = "attached"
+
+var attachCLISSHTunnelForOperation = attachCLISSHTunnel
 
 func cliSSHTunnelOwnsMaster(state cliSSHTunnelState) bool {
 	return state.Kind != cliSSHAttachedKind
@@ -52,8 +55,14 @@ func cliSSHConfigControlPath(sshPath string, profile cliSSHProfile) string {
 	if profile.Jump != "" {
 		args = append(args, "-o", "ProxyJump="+profile.Jump)
 	}
+	for _, option := range profile.Options {
+		args = append(args, "-o", option)
+	}
 	args = append(args, profile.Host)
-	command := exec.Command(sshPath, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, sshPath, args...)
+	command.WaitDelay = time.Second
 	prepareCLISSHNonInteractiveCommand(command)
 	output, err := command.Output()
 	if err != nil {
@@ -294,16 +303,6 @@ func attachCLISSHProfile(name string) (cliSSHTunnelState, bool, error) {
 			_ = clearCLISSHLastError(profile.Name)
 			return old, true, nil
 		}
-		if err := stopCLIStateTunnelForOperation(old); err != nil {
-			_ = saveCLISSHLastError(old.Name, err.Error())
-			return cliSSHTunnelState{}, false,
-				fmt.Errorf("stop broken SSH tunnel %q: %w", old.Name, err)
-		}
-	} else if oldActive {
-		if err := stopCLIStateTunnelForOperation(old); err != nil {
-			return cliSSHTunnelState{}, false,
-				fmt.Errorf("stop previous SSH tunnel %q: %w", old.Name, err)
-		}
 	}
 	controlPath, ok := findCLILiveSSHMaster(profile)
 	if !ok {
@@ -314,9 +313,40 @@ func attachCLISSHProfile(name string) (cliSSHTunnelState, bool, error) {
 		_ = saveCLISSHLastError(profile.Name, err.Error())
 		return cliSSHTunnelState{}, false, err
 	}
-	state, err := attachCLISSHTunnel(profile, controlPath)
+	// Do not disrupt the current route merely because the requested master
+	// cannot be captured. Validate the target before releasing our old tunnel.
+	profile, err = prepareCLISSHProfileCredentials(profile, cliSSHCredentials{})
+	if err != nil {
+		return cliSSHTunnelState{}, false, err
+	}
+	var oldProfile cliSSHProfile
+	if oldActive {
+		oldProfile, err = loadCLISSHProfile(old.Name)
+		if err != nil {
+			return cliSSHTunnelState{}, false, fmt.Errorf("cannot restore current SSH profile: %w", err)
+		}
+		if err := stopCLIStateTunnelForOperation(old); err != nil {
+			_ = saveCLISSHLastError(old.Name, err.Error())
+			return cliSSHTunnelState{}, false,
+				fmt.Errorf("stop previous SSH tunnel %q: %w", old.Name, err)
+		}
+	}
+	state, err := attachCLISSHTunnelForOperation(profile, controlPath)
 	if err != nil {
 		_ = saveCLISSHLastError(profile.Name, err.Error())
+		if oldActive {
+			var restoreErr error
+			if cliSSHTunnelOwnsMaster(old) {
+				_, restoreErr = startCLIPersistentSSHTunnelForOperation(oldProfile)
+			} else {
+				// An external master must never be replaced by a new login.
+				_, restoreErr = attachCLISSHTunnelForOperation(oldProfile, old.ControlPath)
+			}
+			if restoreErr != nil {
+				return cliSSHTunnelState{}, false, fmt.Errorf("capture SSH: %v; restore previous tunnel %q: %w", err, old.Name, restoreErr)
+			}
+			return cliSSHTunnelState{}, false, fmt.Errorf("capture SSH: %w; previous tunnel %q restored", err, old.Name)
+		}
 		return cliSSHTunnelState{}, false, err
 	}
 	_ = clearCLISSHLastError(profile.Name)
@@ -350,7 +380,8 @@ func listCLISSHAttachCandidates() ([]string, error) {
 
 func cliSSHAttachCommand(args []string) error {
 	if cliSubcommandHelp(args) {
-		return errors.New("usage: flclash ssh attach [NAME] | --list")
+		fmt.Println("Usage: flclash ssh attach [NAME] | --list")
+		return nil
 	}
 	if len(args) == 1 && args[0] == "--list" {
 		lines, err := listCLISSHAttachCandidates()

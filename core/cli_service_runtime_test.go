@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,39 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCloseConnectionsRespectsVisibleUserScope(t *testing.T) {
+	var deleted []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"connections":[{"id":"own","metadata":{"uid":1001}},{"id":"other","metadata":{"uid":1002}}]}`))
+			return
+		}
+		deleted = append(deleted, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	controller := controllerClient{options: controllerOptions{address: server.URL}}
+	if err := closeTUIVisibleConnections(controller, 1001, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(deleted, ",") != "/connections/own" {
+		t.Fatalf("deleted %v", deleted)
+	}
+	deleted = nil
+	if err := closeTUIVisibleConnections(controller, 1001, false, "other"); err == nil {
+		t.Fatal("other user's connection was accepted")
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("deleted invisible connection: %v", deleted)
+	}
+	if err := closeTUIVisibleConnections(controller, 1001, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(deleted, ",") != "/connections" {
+		t.Fatalf("system scope deleted %v", deleted)
+	}
+}
 
 func newTestTUIServiceRuntime(t *testing.T) *tuiServiceRuntime {
 	t.Helper()

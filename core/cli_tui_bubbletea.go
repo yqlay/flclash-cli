@@ -190,6 +190,13 @@ type tuiSSHCommandResultMsg struct {
 	err          error
 }
 
+type tuiSSHCaptureResultMsg struct {
+	generation uint64
+	names      []string
+	options    []string
+	selected   int
+}
+
 type tuiSSHRelayStatsMsg struct {
 	name  string
 	stats cliSSHRelayStats
@@ -316,6 +323,7 @@ type tuiModel struct {
 	sshCredentialIdentity    string
 	sshCredentialInput       []rune
 	sshCaptureOpen           bool
+	sshCaptureGeneration     uint64
 	sshCaptureNames          []string
 	sshCaptureOptions        []string
 	sshCaptureSelected       int
@@ -656,6 +664,17 @@ func (m *tuiModel) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			Down: message.update.Traffic.DownTotal,
 		}
 		return m, m.waitTrafficUpdate()
+	case tuiSSHCaptureResultMsg:
+		if !m.sshCaptureOpen || message.generation != m.sshCaptureGeneration {
+			return m, nil
+		}
+		m.sshCaptureNames = message.names
+		m.sshCaptureOptions = message.options
+		m.sshCaptureSelected = message.selected
+		if len(message.options) == 0 {
+			m.sshCaptureOptions = []string{"No live ControlMaster matches a FlClash SSH profile"}
+		}
+		return m, nil
 	case tuiSSHRelayStatsMsg:
 		if m.selectedSSHName() != message.name {
 			return m, nil
@@ -1931,7 +1950,7 @@ func (m *tuiModel) handleKey(key tuiKey) tea.Cmd {
 						state.backendRevision = status.Revision
 					}
 				} else {
-					err = m.client.closeAllConnections()
+					err = closeTUIVisibleConnections(m.client, uint32(os.Getuid()), state.snapshot.Settings.TunEnabled && state.snapshot.Settings.TunScope == tuiTunScopeSystem, "")
 				}
 				if err != nil {
 					state.snapshot.Status = "Close connections failed: " + err.Error()
@@ -1986,7 +2005,7 @@ func (m *tuiModel) handleKey(key tuiKey) tea.Cmd {
 						state.backendRevision = status.Revision
 					}
 				} else {
-					err = m.client.closeConnection(connectionID)
+					err = closeTUIVisibleConnections(m.client, uint32(os.Getuid()), state.snapshot.Settings.TunEnabled && state.snapshot.Settings.TunScope == tuiTunScopeSystem, connectionID)
 				}
 				if err != nil {
 					state.snapshot.Status = "Close connection failed: " + err.Error()
@@ -3939,11 +3958,26 @@ func (m *tuiModel) beginSSHCapture() tea.Cmd {
 		m.snapshot.Status = "Focus SSH profiles before capturing a live session"
 		return nil
 	}
-	names := make([]string, 0, len(m.snapshot.SSHProfiles))
-	options := make([]string, 0, len(m.snapshot.SSHProfiles))
-	selected := 0
+	profiles := append([]tuiSSHProfile(nil), m.snapshot.SSHProfiles...)
 	current := m.selectedSSHName()
-	for _, profile := range m.snapshot.SSHProfiles {
+	m.sshCaptureGeneration++
+	generation := m.sshCaptureGeneration
+	m.sshCaptureOpen = true
+	m.sshCaptureNames = nil
+	m.sshCaptureOptions = []string{"Checking existing SSH connections… · Esc cancel"}
+	m.sshCaptureSelected = 0
+	return func() tea.Msg {
+		result := discoverTUISSHCapture(profiles, current)
+		result.generation = generation
+		return result
+	}
+}
+
+func discoverTUISSHCapture(profiles []tuiSSHProfile, current string) tuiSSHCaptureResultMsg {
+	names := make([]string, 0, len(profiles))
+	options := make([]string, 0, len(profiles))
+	selected := 0
+	for _, profile := range profiles {
 		if profile.NeedsUsername || (profile.Connected && profile.Ready) {
 			continue
 		}
@@ -3953,6 +3987,7 @@ func (m *tuiModel) beginSSHCapture() tea.Cmd {
 			Host:     profile.Host,
 			Port:     profile.Port,
 			Jump:     profile.Jump,
+			Options:  append([]string(nil), profile.Options...),
 		})
 		path, ok := findCLILiveSSHMaster(candidate)
 		if !ok {
@@ -3969,19 +4004,7 @@ func (m *tuiModel) beginSSHCapture() tea.Cmd {
 		names = append(names, profile.Name)
 		options = append(options, label)
 	}
-	m.sshCaptureOpen = true
-	m.sshCaptureNames = names
-	m.sshCaptureSelected = selected
-	if len(options) == 0 {
-		m.sshCaptureOptions = []string{
-			"No live ControlMaster matches a FlClash SSH profile",
-		}
-		m.snapshot.Status = "No capturable SSH session · ordinary ssh cannot be reused"
-		return nil
-	}
-	m.sshCaptureOptions = options
-	m.snapshot.Status = "Select a live ControlMaster to reuse for SOCKS reverse proxy"
-	return nil
+	return tuiSSHCaptureResultMsg{names: names, options: options, selected: selected}
 }
 
 func (m *tuiModel) handleSSHCapture(message tea.KeyMsg) tea.Cmd {

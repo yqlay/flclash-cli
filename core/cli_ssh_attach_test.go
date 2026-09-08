@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,6 +13,58 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCaptureFailureRestoresExternalMasterWithoutLogin(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	directory := t.TempDir()
+	control := filepath.Join(directory, "master")
+	if err := os.WriteFile(control, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ncase \" $* \" in *' -G '*) printf 'controlmaster auto\\ncontrolpath %s\\n' '" + control + "';; *) exit 0;; esac\n"
+	if err := os.WriteFile(filepath.Join(directory, "ssh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory)
+	for _, name := range []string{"old", "target"} {
+		if err := addCLISSHProfile(cliSSHProfile{Name: name, Username: "user", Host: "example.test", Port: 22}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousActive, previousStop := activeCLIPersistentSSHTunnelForOperation, stopCLIStateTunnelForOperation
+	previousAttach, previousStart := attachCLISSHTunnelForOperation, startCLIPersistentSSHTunnelForOperation
+	t.Cleanup(func() {
+		activeCLIPersistentSSHTunnelForOperation, stopCLIStateTunnelForOperation = previousActive, previousStop
+		attachCLISSHTunnelForOperation, startCLIPersistentSSHTunnelForOperation = previousAttach, previousStart
+	})
+	activeCLIPersistentSSHTunnelForOperation = func() (cliSSHTunnelState, bool, error) {
+		return cliSSHTunnelState{Name: "old", Kind: cliSSHAttachedKind, ControlPath: control}, true, nil
+	}
+	stopCLIStateTunnelForOperation = func(cliSSHTunnelState) error { return nil }
+	startCLIPersistentSSHTunnelForOperation = func(cliSSHProfile) (cliSSHTunnelState, error) {
+		t.Fatal("restoration must not create a new login")
+		return cliSSHTunnelState{}, nil
+	}
+	restored := false
+	attachCLISSHTunnelForOperation = func(profile cliSSHProfile, path string) (cliSSHTunnelState, error) {
+		if profile.Name == "target" {
+			return cliSSHTunnelState{}, errors.New("forward refused")
+		}
+		restored = profile.Name == "old" && path == control
+		return cliSSHTunnelState{Name: profile.Name}, nil
+	}
+	_, _, err := attachCLISSHProfile("target")
+	if err == nil || !restored || !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("restored=%t err=%v", restored, err)
+	}
+}
+
+func TestSSHAttachHelpSucceedsWithoutConfiguration(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := cliSSHAttachCommand([]string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestCLISSHCancelForwardDoesNotExitMaster(t *testing.T) {
 	state := cliSSHTunnelState{
@@ -34,6 +87,68 @@ func TestCLISSHCancelForwardDoesNotExitMaster(t *testing.T) {
 	}
 	if strings.Contains(joined, " -O exit ") {
 		t.Fatalf("cancel arguments must not exit the master: %s", joined)
+	}
+}
+
+func TestAttachMissingMasterPreservesCurrentTunnel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if err := addCLISSHProfile(cliSSHProfile{Name: "target", Username: "user", Host: "example.com", Port: 22}); err != nil {
+		t.Fatal(err)
+	}
+	previousActive := activeCLIPersistentSSHTunnelForOperation
+	previousStop := stopCLIStateTunnelForOperation
+	t.Cleanup(func() {
+		activeCLIPersistentSSHTunnelForOperation = previousActive
+		stopCLIStateTunnelForOperation = previousStop
+	})
+	activeCLIPersistentSSHTunnelForOperation = func() (cliSSHTunnelState, bool, error) {
+		return cliSSHTunnelState{Name: "current"}, true, nil
+	}
+	stopped := false
+	stopCLIStateTunnelForOperation = func(cliSSHTunnelState) error {
+		stopped = true
+		return nil
+	}
+	if _, _, err := attachCLISSHProfile("target"); err == nil {
+		t.Fatal("missing master must fail")
+	}
+	if stopped {
+		t.Fatal("unavailable capture target disconnected the current tunnel")
+	}
+}
+
+func TestTUICaptureIgnoresStaleDiscovery(t *testing.T) {
+	model := newTUIModel(controllerClient{}, cliPaths{}, nil, true)
+	model.sshCaptureOpen = true
+	model.sshCaptureGeneration = 2
+	model.Update(tuiSSHCaptureResultMsg{generation: 1, names: []string{"stale"}})
+	if len(model.sshCaptureNames) != 0 {
+		t.Fatal("old discovery replaced a newer picker")
+	}
+}
+
+func TestSSHShutdownDoesNotTreatLastErrorAsTunnel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := saveCLISSHLastError("school", "connection refused"); err != nil {
+		t.Fatal(err)
+	}
+	previousStop := stopCLIStateTunnelForOperation
+	t.Cleanup(func() { stopCLIStateTunnelForOperation = previousStop })
+	stopCLIStateTunnelForOperation = func(state cliSSHTunnelState) error {
+		t.Fatalf("diagnostic file treated as a tunnel: %s", state.StatePath)
+		return nil
+	}
+	if err := stopAllCLISSHTunnels(); err != nil {
+		t.Fatal(err)
+	}
+	last, err := loadCLISSHLastError()
+	if err != nil || last.Name != "school" {
+		t.Fatalf("diagnostic lost during shutdown: %v", err)
 	}
 }
 
@@ -436,9 +551,14 @@ func TestTUISSHAttachKeyOpensCapturePicker(t *testing.T) {
 		Destination: "deploy@gateway.example.com",
 		Port:        22,
 	}}
-	if command := model.handleKey(tuiKeyAllowLAN); command != nil {
-		t.Fatal("capture picker should wait for confirmation")
+	command := model.handleKey(tuiKeyAllowLAN)
+	if command == nil {
+		t.Fatal("capture discovery must run asynchronously")
 	}
+	if len(model.sshCaptureNames) != 0 {
+		t.Fatal("capture must not probe synchronously")
+	}
+	model.Update(command())
 	if !model.sshCaptureOpen || len(model.sshCaptureNames) != 1 ||
 		model.sshCaptureNames[0] != "home" {
 		t.Fatalf("capture picker = open %t names %v", model.sshCaptureOpen, model.sshCaptureNames)

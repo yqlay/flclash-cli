@@ -222,7 +222,7 @@ resolution. If that host already has a live OpenSSH ControlMaster (for example
 dynamic SOCKS forward and the local traffic relay. `flclash ssh attach [NAME]`
 does the same capture and never starts a second login; `--list` probes matching
 masters. The TUI Capture row and `a` also probe only when you ask; idle refresh
-and `ssh list` do not. Detach (`ssh disconnect`, `backend stop`, or `flclash exit`) cancels
+and `ssh list` do not. Detach (`ssh disconnect` or `flclash exit`) cancels
 the SOCKS forward and leaves the user's SSH session running. A plain interactive
 `ssh user@host` without ControlMaster cannot be captured. `-u NAME` creates a
 separate temporary tunnel for that command and

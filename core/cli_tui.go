@@ -4729,11 +4729,18 @@ func exportTUILogs(homeDir string, logs []string) (string, error) {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(
-		logDir,
-		"flclash-"+time.Now().Format("20060102-150405")+".log",
-	)
-	return path, os.WriteFile(path, []byte(strings.Join(logs, "\n")+"\n"), 0o600)
+	file, err := os.CreateTemp(logDir, "flclash-"+time.Now().Format("20060102-150405")+"-*.log")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	_, writeErr := file.WriteString(strings.Join(logs, "\n") + "\n")
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 func drawTUISettings(b *strings.Builder, snapshot tuiSnapshot, width, height int) {

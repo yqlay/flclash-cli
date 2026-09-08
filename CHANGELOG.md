@@ -1,3 +1,14 @@
+## FlClash TUI v0.5.28
+
+- Add CLI and TUI capture of an existing OpenSSH ControlMaster without a second login; only explicit user operations discover external masters. Recognize OpenSSH's `ControlMaster false` output correctly.
+- Name imported subscriptions using the server-provided filename, with a unique generated fallback.
+
+- Run SSH capture discovery asynchronously with bounded probes and ignore stale picker results. Validate capture targets before disconnecting, and restore the previous tunnel if replacement fails without starting a new login for an external ControlMaster.
+- Prevent control-only SSH helpers from falling back to a fresh network connection; bound the SSH relay's upstream SOCKS handshake and preserve diagnostic state during tunnel shutdown.
+- Import every concrete OpenSSH Host alias, accept tab-separated and quoted fields, resolve shared defaults through OpenSSH, retain aliases for ControlPath matching, and report missing requested hosts.
+- Restrict connection close operations to the same user scope as the Connections list, except for system-wide TUN management.
+- Avoid unchanged History writes and prevent rapid log exports from overwriting previous files. Make SSH attach help exit successfully and correct the Backend/SSH shutdown documentation.
+
 ## FlClash TUI v0.5.27
 
 - Keep Dashboard/Proxies/Connections refreshes on Backend `status` so silent mode, SYSTEM TUN lock, and the `flc` READY/WAITING suffix are not replaced by the Core's silent runtime `mode: rule` overlay.

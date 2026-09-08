@@ -311,11 +311,11 @@ func (r *tuiServiceRuntime) mutate(
 		if strings.TrimSpace(request.ConnectionID) == "" {
 			err = errors.New("connection ID is required")
 		} else {
-			err = r.coreController.closeConnection(request.ConnectionID)
+			err = closeTUIVisibleConnections(r.coreController, uint32(os.Getuid()), status.TunState == "on" && status.TunScope == tuiTunScopeSystem, request.ConnectionID)
 			changed = err == nil
 		}
 	case "close_all_connections":
-		err = r.coreController.closeAllConnections()
+		err = closeTUIVisibleConnections(r.coreController, uint32(os.Getuid()), status.TunState == "on" && status.TunScope == tuiTunScopeSystem, "")
 		changed = err == nil
 	case "put_profile":
 		changed, resultPath, err = r.putProfile(request)
@@ -1458,6 +1458,35 @@ func (r *tuiServiceRuntime) connectionsStatus(requestID string) tuiServiceStatus
 		status.TunState == "on" && status.TunScope == tuiTunScopeSystem,
 	)
 	return status
+}
+
+func closeTUIVisibleConnections(controller controllerClient, uid uint32, systemTun bool, id string) error {
+	if systemTun {
+		if id == "" {
+			return controller.closeAllConnections()
+		}
+		return controller.closeConnection(id)
+	}
+	connections, err := loadTUIActiveConnections(controller)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, connection := range filterTUIConnections(connections, uid, false) {
+		if id != "" && connection.ID != id {
+			continue
+		}
+		if err := controller.closeConnection(connection.ID); err != nil {
+			failures = append(failures, err)
+		}
+		if id != "" {
+			return errors.Join(failures...)
+		}
+	}
+	if id != "" {
+		return errors.New("connection is no longer active or is outside the current user scope")
+	}
+	return errors.Join(failures...)
 }
 
 func filterTUIConnections(
